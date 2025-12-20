@@ -213,9 +213,6 @@ fn load_from_bytes_to_bytes() {
     let crs2 = CRS::from_bytes(&bytes).expect("should deserialize");
     let bytes2 = crs2.to_bytes();
 
-    let hex: Vec<_> = bytes.iter().map(hex::encode).collect();
-    dbg!(hex);
-
     assert_eq!(bytes, bytes2, "bytes should be the same");
 }
 

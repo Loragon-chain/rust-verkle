@@ -10,6 +10,7 @@ pub use serialization::{
 use banderwagon::Element;
 use banderwagon::Fr;
 use ipa_multipoint::committer::{Committer, DefaultCommitter};
+use rayon::prelude::*;
 use ipa_multipoint::crs::CRS;
 use ipa_multipoint::lagrange_basis::PrecomputedWeights;
 use ipa_multipoint::multiproof::{MultiPoint, MultiPointProof, ProverQuery, VerifierQuery};
@@ -258,12 +259,50 @@ pub fn hash_commitment(commitment: CommitmentBytes) -> ScalarBytes {
     // TODO: this is actually a bottleneck for the average workflow before doing this.
     fr_to_le_bytes(Element::from_bytes_unchecked_uncompressed(commitment).map_to_scalar_field())
 }
+
+/// Minimum number of commitments before using parallel processing.
+/// Below this threshold, sequential processing is faster due to thread pool overhead.
+const PARALLEL_HASH_THRESHOLD: usize = 100;
+
 /// Hashes a vector of commitments.
 ///
-/// This is more efficient than repeatedly calling `hash_commitment`
+/// This is more efficient than repeatedly calling `hash_commitment`.
+/// For batches of 100 or more commitments, parallel processing is automatically used.
 ///
 /// Returns a vector of `Scalar`s representing the hash of each commitment
 pub fn hash_commitments(commitments: &[CommitmentBytes]) -> Vec<ScalarBytes> {
+    if commitments.len() < PARALLEL_HASH_THRESHOLD {
+        // Sequential for small batches
+        hash_commitments_sequential(commitments)
+    } else {
+        // Parallel for large batches
+        hash_commitments_impl_parallel(commitments)
+    }
+}
+
+/// Hashes commitments with explicit parallelism control.
+///
+/// Use this when you need to control whether parallel processing is used,
+/// regardless of the batch size.
+///
+/// # Arguments
+/// * `commitments` - The commitments to hash
+/// * `use_parallel` - If true, use parallel processing; if false, use sequential
+///
+/// Returns a vector of `Scalar`s representing the hash of each commitment
+pub fn hash_commitments_parallel(
+    commitments: &[CommitmentBytes],
+    use_parallel: bool,
+) -> Vec<ScalarBytes> {
+    if use_parallel {
+        hash_commitments_impl_parallel(commitments)
+    } else {
+        hash_commitments_sequential(commitments)
+    }
+}
+
+/// Sequential implementation of commitment hashing using batch_map_to_scalar_field
+fn hash_commitments_sequential(commitments: &[CommitmentBytes]) -> Vec<ScalarBytes> {
     let elements = commitments
         .iter()
         .map(|commitment| Element::from_bytes_unchecked_uncompressed(*commitment))
@@ -272,6 +311,14 @@ pub fn hash_commitments(commitments: &[CommitmentBytes]) -> Vec<ScalarBytes> {
     Element::batch_map_to_scalar_field(&elements)
         .into_iter()
         .map(fr_to_le_bytes)
+        .collect()
+}
+
+/// Parallel implementation of commitment hashing using rayon
+fn hash_commitments_impl_parallel(commitments: &[CommitmentBytes]) -> Vec<ScalarBytes> {
+    commitments
+        .par_iter()
+        .map(|commitment| hash_commitment(*commitment))
         .collect()
 }
 
@@ -744,5 +791,122 @@ mod prover_verifier_test {
         let verified = verify_proof(&context, verifier_call_bytes).is_ok();
 
         assert!(verified);
+    }
+}
+
+#[cfg(test)]
+mod parallel_hash_tests {
+    use super::*;
+    use ipa_multipoint::committer::Committer;
+
+    fn create_test_commitments(count: usize) -> Vec<CommitmentBytes> {
+        let context = Context::new();
+        (0..count)
+            .map(|i| {
+                // Create a unique commitment for each index
+                let scalar = banderwagon::Fr::from(i as u128 + 1);
+                let element = context.committer.scalar_mul(scalar, 0);
+                element.to_bytes_uncompressed()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_parallel_hash_determinism() {
+        // Test that parallel hashing produces the same results as sequential
+        let commitments = create_test_commitments(200);
+
+        let sequential = hash_commitments_parallel(&commitments, false);
+        let parallel = hash_commitments_parallel(&commitments, true);
+
+        assert_eq!(
+            sequential, parallel,
+            "Parallel and sequential hashing should produce identical results"
+        );
+    }
+
+    #[test]
+    fn test_parallel_hash_threshold_behavior() {
+        // Below threshold (< 100): should use sequential
+        let small_batch = create_test_commitments(50);
+        let result1 = hash_commitments(&small_batch);
+        let result2 = hash_commitments_sequential(&small_batch);
+        assert_eq!(result1, result2, "Small batch should use sequential implementation");
+
+        // At or above threshold (>= 100): should use parallel
+        let large_batch = create_test_commitments(150);
+        let result3 = hash_commitments(&large_batch);
+        let result4 = hash_commitments_impl_parallel(&large_batch);
+        assert_eq!(result3, result4, "Large batch should use parallel implementation");
+    }
+
+    #[test]
+    fn test_parallel_hash_explicit_control() {
+        let commitments = create_test_commitments(50);
+
+        // Force parallel even with small batch
+        let parallel_result = hash_commitments_parallel(&commitments, true);
+        let sequential_result = hash_commitments_parallel(&commitments, false);
+
+        assert_eq!(
+            parallel_result, sequential_result,
+            "Explicit parallel control should still produce same results"
+        );
+    }
+
+    #[test]
+    fn test_parallel_hash_empty_input() {
+        let empty: Vec<CommitmentBytes> = vec![];
+
+        let sequential = hash_commitments_parallel(&empty, false);
+        let parallel = hash_commitments_parallel(&empty, true);
+
+        assert!(sequential.is_empty());
+        assert!(parallel.is_empty());
+    }
+
+    #[test]
+    fn test_parallel_hash_single_item() {
+        let single = create_test_commitments(1);
+
+        let sequential = hash_commitments_parallel(&single, false);
+        let parallel = hash_commitments_parallel(&single, true);
+
+        assert_eq!(sequential.len(), 1);
+        assert_eq!(parallel.len(), 1);
+        assert_eq!(sequential[0], parallel[0]);
+    }
+
+    #[test]
+    fn test_parallel_hash_large_batch() {
+        // Test with a large batch to verify parallel processing works correctly
+        let large_batch = create_test_commitments(500);
+
+        let sequential = hash_commitments_parallel(&large_batch, false);
+        let parallel = hash_commitments_parallel(&large_batch, true);
+
+        assert_eq!(sequential.len(), 500);
+        assert_eq!(parallel.len(), 500);
+        assert_eq!(
+            sequential, parallel,
+            "Large batch parallel hashing should match sequential"
+        );
+    }
+
+    #[test]
+    fn test_hash_commitments_matches_individual() {
+        // Verify that batch hashing produces same results as individual hashing
+        let commitments = create_test_commitments(10);
+
+        let batch_results = hash_commitments(&commitments);
+        let individual_results: Vec<ScalarBytes> = commitments
+            .iter()
+            .map(|c| hash_commitment(*c))
+            .collect();
+
+        assert_eq!(
+            batch_results, individual_results,
+            "Batch hashing should produce same results as individual hashing"
+        );
     }
 }

@@ -10,4 +10,5 @@ banderwagon = { path = "../banderwagon" }
 ipa-multipoint = { path = "../ipa-multipoint" }
 verkle-spec = { path = "../verkle-spec" }
 hex = "*"
+rayon = "1.8.0"
 verkle-trie = { path = "../verkle-trie" }

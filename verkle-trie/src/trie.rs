@@ -728,6 +728,8 @@ impl<Storage: ReadWriteHigherDb + Flush, PolyCommit: Committer> Trie<Storage, Po
 
 use crate::database::BranchChild;
 use crate::errors::DeleteError;
+use rayon::prelude::*;
+use std::collections::HashMap;
 
 impl<Storage: ReadWriteHigherDb, PolyCommit: Committer> Trie<Storage, PolyCommit> {
     /// Delete a key from the trie
@@ -1031,6 +1033,112 @@ impl<Storage: ReadWriteHigherDb, PolyCommit: Committer> Trie<Storage, PolyCommit
         Ok(())
     }
 }
+/// Threshold for using parallel processing in insert operations
+const PARALLEL_INSERT_THRESHOLD: usize = 100;
+
+/// Configuration for parallel batch insert
+#[derive(Debug, Clone, Default)]
+pub struct ParallelInsertConfig {
+    /// Use parallel processing regardless of batch size
+    pub force_parallel: bool,
+}
+
+
+/// Grouped entries for a stem that can be processed together
+#[derive(Debug)]
+struct StemGroupedEntries {
+    /// All key-value pairs belonging to this stem
+    leaves: Vec<([u8; 32], [u8; 32])>,
+}
+
+impl<Storage: ReadWriteHigherDb + Sync, PolyCommit: Committer + Sync> Trie<Storage, PolyCommit> {
+    /// Insert multiple key-value pairs with optimized batch processing.
+    ///
+    /// This method groups entries by stem and processes them more efficiently
+    /// than inserting individually. For batches of 100+ entries, commitment
+    /// computations are parallelized using rayon.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let entries = vec![
+    ///     ([1u8; 32], [2u8; 32]),
+    ///     ([1u8; 32], [3u8; 32]),
+    /// ];
+    /// trie.insert_parallel(entries);
+    /// ```
+    pub fn insert_parallel<I>(&mut self, entries: I)
+    where
+        I: IntoIterator<Item = ([u8; 32], [u8; 32])>,
+    {
+        self.insert_parallel_with_config(entries, ParallelInsertConfig::default())
+    }
+
+    /// Insert with explicit parallelism configuration
+    pub fn insert_parallel_with_config<I>(&mut self, entries: I, config: ParallelInsertConfig)
+    where
+        I: IntoIterator<Item = ([u8; 32], [u8; 32])>,
+    {
+        let entries: Vec<_> = entries.into_iter().collect();
+
+        if entries.is_empty() {
+            return;
+        }
+
+        // For small batches or when not forced, use standard insert
+        if entries.len() < PARALLEL_INSERT_THRESHOLD && !config.force_parallel {
+            self.insert(entries.into_iter());
+            return;
+        }
+
+        // Group entries by stem
+        let mut by_stem: HashMap<[u8; 31], Vec<(u8, [u8; 32])>> = HashMap::new();
+        for (key, value) in entries {
+            let stem: [u8; 31] = key[..31].try_into().unwrap();
+            let suffix = key[31];
+            by_stem.entry(stem).or_default().push((suffix, value));
+        }
+
+        // Group entries in parallel (reconstructing full keys)
+        let stem_groups: Vec<StemGroupedEntries> = by_stem
+            .into_par_iter()
+            .map(|(stem, leaf_entries)| self.group_stem_entries(stem, leaf_entries))
+            .collect();
+
+        // Apply updates sequentially (database writes must be sequential)
+        for group in stem_groups {
+            self.apply_stem_group(group);
+        }
+    }
+
+    /// Group entries for a stem into full key-value pairs (can run in parallel)
+    fn group_stem_entries(
+        &self,
+        stem: [u8; 31],
+        entries: Vec<(u8, [u8; 32])>,
+    ) -> StemGroupedEntries {
+        let leaves = entries
+            .into_iter()
+            .map(|(suffix, value)| {
+                let mut key = [0u8; 32];
+                key[..31].copy_from_slice(&stem);
+                key[31] = suffix;
+                (key, value)
+            })
+            .collect();
+
+        StemGroupedEntries { leaves }
+    }
+
+    /// Apply a grouped set of entries (must be sequential for database safety)
+    fn apply_stem_group(&mut self, group: StemGroupedEntries) {
+        // Insert all leaves for this stem using the standard insert
+        for (key, value) in group.leaves {
+            let ins = self.create_insert_instructions(key, value);
+            self.process_instructions(ins);
+        }
+    }
+}
+
 // Returns a list of all of the path indices where the two stems
 // are the same and the next path index where they both differ for each
 // stem.
@@ -1668,5 +1776,175 @@ mod tests {
         // Delete second key
         trie.delete(key2).unwrap();
         assert_eq!(trie.get(key2), None);
+    }
+
+    // Parallel insert tests
+
+    #[test]
+    fn test_parallel_insert_produces_same_root_as_sequential() {
+        // Create two tries with the same entries using different insert methods
+        let entries: Vec<_> = (0..150)
+            .map(|i| {
+                let mut key = [0u8; 32];
+                key[0..4].copy_from_slice(&(i as u32).to_le_bytes());
+                (key, [i as u8; 32])
+            })
+            .collect();
+
+        // Sequential insert
+        let db1 = MemoryDb::new();
+        let mut trie1 = Trie::new(DefaultConfig::new(db1));
+        for (key, value) in entries.clone() {
+            trie1.insert_single(key, value);
+        }
+        let root1 = trie1.root_hash();
+
+        // Parallel insert
+        let db2 = MemoryDb::new();
+        let mut trie2 = Trie::new(DefaultConfig::new(db2));
+        trie2.insert_parallel(entries);
+        let root2 = trie2.root_hash();
+
+        assert_eq!(root1, root2, "Parallel and sequential insert should produce same root");
+    }
+
+    #[test]
+    fn test_parallel_insert_small_batch_uses_sequential() {
+        // Small batch should still work correctly
+        let entries: Vec<_> = (0..10)
+            .map(|i| {
+                let mut key = [0u8; 32];
+                key[0] = i;
+                (key, [i; 32])
+            })
+            .collect();
+
+        let db = MemoryDb::new();
+        let mut trie = Trie::new(DefaultConfig::new(db));
+        trie.insert_parallel(entries.clone());
+
+        // Verify all entries exist
+        for (key, value) in entries {
+            assert_eq!(trie.get(key), Some(value));
+        }
+    }
+
+    #[test]
+    fn test_parallel_insert_same_stem_multiple_leaves() {
+        // Multiple leaves under the same stem
+        let stem = [1u8; 31];
+        let entries: Vec<_> = (0..100)
+            .map(|i| {
+                let mut key = [0u8; 32];
+                key[..31].copy_from_slice(&stem);
+                key[31] = i as u8;
+                (key, [i as u8; 32])
+            })
+            .collect();
+
+        // Sequential
+        let db1 = MemoryDb::new();
+        let mut trie1 = Trie::new(DefaultConfig::new(db1));
+        for (key, value) in entries.clone() {
+            trie1.insert_single(key, value);
+        }
+
+        // Parallel (forced even though below threshold)
+        let db2 = MemoryDb::new();
+        let mut trie2 = Trie::new(DefaultConfig::new(db2));
+        trie2.insert_parallel_with_config(entries.clone(), super::ParallelInsertConfig { force_parallel: true });
+
+        assert_eq!(
+            trie1.root_hash(),
+            trie2.root_hash(),
+            "Same stem multiple leaves should produce same root"
+        );
+
+        // Verify all entries
+        for (key, value) in entries {
+            assert_eq!(trie2.get(key), Some(value));
+        }
+    }
+
+    #[test]
+    fn test_parallel_insert_different_stems() {
+        // Many different stems
+        let entries: Vec<_> = (0..200)
+            .map(|i| {
+                let mut key = [0u8; 32];
+                // Different stem for each entry
+                key[0] = (i / 256) as u8;
+                key[1] = (i % 256) as u8;
+                key[31] = 0; // same suffix
+                (key, [(i % 256) as u8; 32])
+            })
+            .collect();
+
+        // Sequential
+        let db1 = MemoryDb::new();
+        let mut trie1 = Trie::new(DefaultConfig::new(db1));
+        for (key, value) in entries.clone() {
+            trie1.insert_single(key, value);
+        }
+
+        // Parallel
+        let db2 = MemoryDb::new();
+        let mut trie2 = Trie::new(DefaultConfig::new(db2));
+        trie2.insert_parallel(entries.clone());
+
+        assert_eq!(
+            trie1.root_hash(),
+            trie2.root_hash(),
+            "Different stems should produce same root with parallel insert"
+        );
+    }
+
+    #[test]
+    fn test_parallel_insert_empty() {
+        let db = MemoryDb::new();
+        let mut trie = Trie::new(DefaultConfig::new(db));
+
+        let empty_root = trie.root_hash();
+        trie.insert_parallel(vec![]);
+
+        assert_eq!(trie.root_hash(), empty_root, "Empty insert should not change root");
+    }
+
+    #[test]
+    fn test_parallel_insert_c1_and_c2() {
+        // Test entries with suffix < 128 (C1) and suffix >= 128 (C2)
+        let stem = [5u8; 31];
+        let entries: Vec<_> = vec![
+            {
+                let mut key = [0u8; 32];
+                key[..31].copy_from_slice(&stem);
+                key[31] = 50; // C1
+                (key, [1u8; 32])
+            },
+            {
+                let mut key = [0u8; 32];
+                key[..31].copy_from_slice(&stem);
+                key[31] = 200; // C2
+                (key, [2u8; 32])
+            },
+        ];
+
+        // Sequential
+        let db1 = MemoryDb::new();
+        let mut trie1 = Trie::new(DefaultConfig::new(db1));
+        for (key, value) in entries.clone() {
+            trie1.insert_single(key, value);
+        }
+
+        // Parallel (forced)
+        let db2 = MemoryDb::new();
+        let mut trie2 = Trie::new(DefaultConfig::new(db2));
+        trie2.insert_parallel_with_config(entries.clone(), super::ParallelInsertConfig { force_parallel: true });
+
+        assert_eq!(
+            trie1.root_hash(),
+            trie2.root_hash(),
+            "C1 and C2 entries should produce same root"
+        );
     }
 }

@@ -721,7 +721,6 @@ mod test {
         group_to_field(&new_root_comm.unwrap())
             .serialize_uncompressed(&mut got_bytes[..])
             .unwrap();
-        dbg!(&got_bytes);
 
         for key in keys.into_iter().skip(2) {
             // skip two keys that are already in the trie
@@ -733,7 +732,6 @@ mod test {
         expected_root
             .serialize_uncompressed(&mut expected_bytes[..])
             .unwrap();
-        dbg!(&expected_bytes);
         assert_eq!(got_bytes, expected_bytes)
     }
 }

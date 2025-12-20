@@ -10,7 +10,7 @@ pub mod trie;
 
 pub use config::*;
 use errors::ProofCreationError;
-pub use trie::Trie;
+pub use trie::{ParallelInsertConfig, Trie};
 
 pub use banderwagon::{Element, Fr};
 
