@@ -1,5 +1,21 @@
 use crate::{default_crs, ipa::slow_vartime_multiscalar_mul, lagrange_basis::LagrangeBasis};
 use banderwagon::{try_reduce_to_element, Element};
+use thiserror::Error;
+
+/// Size of a single uncompressed point in bytes
+pub const UNCOMPRESSED_POINT_SIZE: usize = 64;
+
+#[derive(Debug, Error)]
+pub enum CRSError {
+    #[error("Invalid CRS byte length: expected {expected}, got {actual}")]
+    InvalidLength { expected: usize, actual: usize },
+
+    #[error("Duplicate points detected in CRS at indices {0} and {1}")]
+    DuplicatePoints(usize, usize),
+
+    #[error("Failed to deserialize point at index {index}: {reason}")]
+    PointDeserializationError { index: usize, reason: String },
+}
 
 #[allow(non_snake_case)]
 #[derive(Debug, Clone)]
@@ -36,18 +52,46 @@ impl CRS {
 
     #[allow(non_snake_case)]
     // The last element is implied to be `Q`
-    pub fn from_bytes(bytes: &[[u8; 64]]) -> CRS {
+    pub fn from_bytes(bytes: &[[u8; 64]]) -> Result<CRS, CRSError> {
         let (q_bytes, g_vec_bytes) = bytes
             .split_last()
-            .expect("bytes vector should not be empty");
+            .ok_or_else(|| CRSError::InvalidLength {
+                expected: 1,
+                actual: 0,
+            })?;
 
-        let Q = Element::from_bytes_unchecked_uncompressed(*q_bytes);
-        let G: Vec<_> = g_vec_bytes
-            .iter()
-            .map(|bytes| Element::from_bytes_unchecked_uncompressed(*bytes))
-            .collect();
+        let Q = Element::try_from_bytes_uncompressed(*q_bytes).map_err(|e| {
+            CRSError::PointDeserializationError {
+                index: g_vec_bytes.len(),
+                reason: e.to_string(),
+            }
+        })?;
+
+        let mut G = Vec::with_capacity(g_vec_bytes.len());
+        for (index, bytes) in g_vec_bytes.iter().enumerate() {
+            let point = Element::try_from_bytes_uncompressed(*bytes).map_err(|e| {
+                CRSError::PointDeserializationError {
+                    index,
+                    reason: e.to_string(),
+                }
+            })?;
+            G.push(point);
+        }
+
+        // Check for duplicates
+        Self::validate_no_duplicates(&G)?;
+
         let n = G.len();
-        CRS { G, Q, n }
+        Ok(CRS { G, Q, n })
+    }
+
+    /// Deserialize CRS from bytes, panicking on error
+    ///
+    /// # Panics
+    /// Panics if bytes are invalid. Prefer `from_bytes()` which returns Result.
+    #[deprecated(since = "1.0.0", note = "Use from_bytes() which returns Result")]
+    pub fn from_bytes_unchecked(bytes: &[[u8; 64]]) -> Self {
+        Self::from_bytes(bytes).expect("Failed to deserialize CRS")
     }
     pub fn from_hex(hex_encoded_crs: &[&str]) -> CRS {
         let bytes: Vec<[u8; 64]> = hex_encoded_crs
@@ -55,7 +99,7 @@ impl CRS {
             .map(|hex| hex::decode(hex).unwrap())
             .map(|byte_vector| byte_vector.try_into().unwrap())
             .collect();
-        CRS::from_bytes(&bytes)
+        CRS::from_bytes(&bytes).expect("Failed to deserialize CRS from hex")
     }
 
     pub fn to_bytes(&self) -> Vec<[u8; 64]> {
@@ -69,6 +113,18 @@ impl CRS {
 
     pub fn to_hex(&self) -> Vec<String> {
         self.to_bytes().iter().map(hex::encode).collect()
+    }
+
+    /// Check that no two points in the CRS are identical
+    fn validate_no_duplicates(points: &[Element]) -> Result<(), CRSError> {
+        for i in 0..points.len() {
+            for j in (i + 1)..points.len() {
+                if points[i] == points[j] {
+                    return Err(CRSError::DuplicatePoints(i, j));
+                }
+            }
+        }
+        Ok(())
     }
 
     // Asserts that not of the points generated are the same
@@ -154,11 +210,64 @@ fn crs_consistency() {
 fn load_from_bytes_to_bytes() {
     let crs = CRS::new(256, b"eth_verkle_oct_2021");
     let bytes = crs.to_bytes();
-    let crs2 = CRS::from_bytes(&bytes);
+    let crs2 = CRS::from_bytes(&bytes).expect("should deserialize");
     let bytes2 = crs2.to_bytes();
 
     let hex: Vec<_> = bytes.iter().map(hex::encode).collect();
     dbg!(hex);
 
     assert_eq!(bytes, bytes2, "bytes should be the same");
+}
+
+#[cfg(test)]
+mod error_handling_tests {
+    use super::*;
+
+    /// Test: Valid CRS bytes deserialize successfully
+    #[test]
+    fn test_from_bytes_valid() {
+        let crs = CRS::new(256, b"test_seed");
+        let bytes = crs.to_bytes();
+
+        let restored = CRS::from_bytes(&bytes);
+        assert!(restored.is_ok());
+        assert_eq!(restored.unwrap().G.len(), 256);
+    }
+
+    /// Test: Empty bytes returns InvalidLength error
+    #[test]
+    fn test_from_bytes_empty() {
+        let result = CRS::from_bytes(&[]);
+        assert!(matches!(
+            result,
+            Err(CRSError::InvalidLength { expected: 1, actual: 0 })
+        ));
+    }
+
+    /// Test: Corrupted point returns PointDeserializationError
+    #[test]
+    fn test_from_bytes_corrupted_point() {
+        // Create array of invalid point data (all 0xFF bytes)
+        let corrupted_bytes: Vec<[u8; 64]> = vec![[0xFF; 64]; 257]; // 256 G points + 1 Q point
+
+        let result = CRS::from_bytes(&corrupted_bytes);
+        // The last point is Q, so it should fail at index 256
+        assert!(matches!(
+            result,
+            Err(CRSError::PointDeserializationError { index: 256, .. })
+        ));
+    }
+
+    /// Test: Duplicate points returns DuplicatePoints error
+    #[test]
+    fn test_from_bytes_duplicate_points() {
+        let crs = CRS::new(256, b"test_seed");
+        let mut bytes = crs.to_bytes();
+
+        // Copy first point to second position
+        bytes[1] = bytes[0];
+
+        let result = CRS::from_bytes(&bytes);
+        assert!(matches!(result, Err(CRSError::DuplicatePoints(0, 1))));
+    }
 }

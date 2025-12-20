@@ -74,6 +74,14 @@ impl Element {
         Self(point)
     }
 
+    /// Try to deserialize from uncompressed bytes, returning an error on failure
+    pub fn try_from_bytes_uncompressed(
+        bytes: [u8; 64],
+    ) -> Result<Self, ark_serialize::SerializationError> {
+        let point = EdwardsProjective::deserialize_uncompressed_unchecked(&bytes[..])?;
+        Ok(Self(point))
+    }
+
     pub fn from_bytes(bytes: &[u8]) -> Option<Element> {
         // Switch from big endian to little endian, as arkworks library uses little endian
         let mut bytes = bytes.to_vec();
