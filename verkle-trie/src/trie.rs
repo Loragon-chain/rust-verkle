@@ -725,6 +725,312 @@ impl<Storage: ReadWriteHigherDb + Flush, PolyCommit: Committer> Trie<Storage, Po
         self.storage.flush()
     }
 }
+
+use crate::database::BranchChild;
+use crate::errors::DeleteError;
+
+impl<Storage: ReadWriteHigherDb, PolyCommit: Committer> Trie<Storage, PolyCommit> {
+    /// Delete a key from the trie
+    ///
+    /// Returns `Ok(Some(old_value))` if the key existed and was deleted,
+    /// `Ok(None)` if the key did not exist, or an error if deletion failed.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let old_value = trie.delete(key)?;
+    /// match old_value {
+    ///     Some(v) => println!("Deleted value: {:?}", v),
+    ///     None => println!("Key did not exist"),
+    /// }
+    /// ```
+    pub fn delete(&mut self, key: [u8; 32]) -> Result<Option<[u8; 32]>, DeleteError> {
+        // 1. Check if key exists
+        let old_value = match self.storage.get_leaf(key) {
+            Some(v) => v,
+            None => return Ok(None),
+        };
+
+        let stem: [u8; 31] = key[..31].try_into().unwrap();
+        let suffix = key[31];
+
+        // 2. Delete the leaf
+        self.storage.delete_leaf(key);
+
+        // 3. Check if stem is now empty
+        let stem_children = self.storage.get_stem_children(stem);
+        let stem_is_empty = stem_children.is_empty();
+
+        if stem_is_empty {
+            // Delete stem and prune empty branches
+            self.delete_stem_and_prune(stem)?;
+        } else {
+            // Update stem commitment
+            self.update_stem_after_delete(stem, suffix, old_value)?;
+        }
+
+        Ok(Some(old_value))
+    }
+
+    /// Update stem commitment after deleting a leaf
+    ///
+    /// Algorithm:
+    /// 1. Determine which commitment to update (C1 for suffix < 128, C2 otherwise)
+    /// 2. Compute delta = old_scalar * G[2*suffix] + old_scalar_high * G[2*suffix + 1]
+    /// 3. Subtract delta from C1 or C2
+    /// 4. Recompute stem commitment
+    /// 5. Update parent branch
+    fn update_stem_after_delete(
+        &mut self,
+        stem: [u8; 31],
+        suffix: u8,
+        old_value: [u8; 32],
+    ) -> Result<(), DeleteError> {
+        let stem_meta = self
+            .storage
+            .get_stem_meta(stem)
+            .ok_or(DeleteError::StemNotFound(stem))?;
+
+        // Split old value into low and high 16-byte chunks
+        let old_value_low = Fr::from_le_bytes_mod_order(&old_value[..16]) + TWO_POW_128;
+        let old_value_high = Fr::from_le_bytes_mod_order(&old_value[16..]);
+
+        // Compute which generators to use
+        let pos_mod_128 = (suffix % 128) as usize;
+        let low_index = 2 * pos_mod_128;
+        let high_index = low_index + 1;
+
+        // Compute the commitment delta to subtract
+        let delta = self.committer.scalar_mul(old_value_low, low_index)
+            + self.committer.scalar_mul(old_value_high, high_index);
+
+        // Update C1 or C2
+        let (new_c1, new_hash_c1, new_c2, new_hash_c2) = if suffix < 128 {
+            let new_c1 = stem_meta.c_1 - delta;
+            let new_hash_c1 = group_to_field(&new_c1);
+            (new_c1, new_hash_c1, stem_meta.c_2, stem_meta.hash_c2)
+        } else {
+            let new_c2 = stem_meta.c_2 - delta;
+            let new_hash_c2 = group_to_field(&new_c2);
+            (stem_meta.c_1, stem_meta.hash_c1, new_c2, new_hash_c2)
+        };
+
+        // Recompute stem commitment: update based on C1/C2 change
+        let new_stem_commitment = if suffix < 128 {
+            let c1_delta = new_hash_c1 - stem_meta.hash_c1;
+            stem_meta.stem_commitment + self.committer.scalar_mul(c1_delta, 2)
+        } else {
+            let c2_delta = new_hash_c2 - stem_meta.hash_c2;
+            stem_meta.stem_commitment + self.committer.scalar_mul(c2_delta, 3)
+        };
+
+        let new_hash_stem_commitment = group_to_field(&new_stem_commitment);
+
+        // Get depth for this stem
+        let depth = self.get_stem_depth(&stem);
+
+        // Update database with new stem metadata
+        let new_meta = StemMeta {
+            c_1: new_c1,
+            hash_c1: new_hash_c1,
+            c_2: new_c2,
+            hash_c2: new_hash_c2,
+            stem_commitment: new_stem_commitment,
+            hash_stem_commitment: new_hash_stem_commitment,
+        };
+
+        self.storage.insert_stem(stem, new_meta, depth);
+
+        // Update parent branch commitment
+        self.update_parent_after_stem_change(
+            &stem,
+            stem_meta.hash_stem_commitment,
+            new_hash_stem_commitment,
+            depth,
+        )?;
+
+        Ok(())
+    }
+
+    /// Delete a stem node and prune any resulting empty branches
+    ///
+    /// Algorithm:
+    /// 1. Find path from root to stem
+    /// 2. Delete stem
+    /// 3. Remove stem reference from parent branch
+    /// 4. Walk up the tree, pruning empty branches
+    fn delete_stem_and_prune(&mut self, stem: [u8; 31]) -> Result<(), DeleteError> {
+        let stem_meta = self
+            .storage
+            .get_stem_meta(stem)
+            .ok_or(DeleteError::StemNotFound(stem))?;
+
+        // Delete stem from database
+        self.storage.delete_stem(stem);
+
+        // Get path to stem and remove from parent branch
+        let depth = self.get_stem_depth(&stem);
+        let path = stem[..depth as usize].to_vec();
+        let child_index = stem[depth as usize];
+
+        // Remove stem from parent branch and update commitment
+        self.remove_child_from_branch(&path, child_index, stem_meta.hash_stem_commitment)?;
+
+        // Prune empty branches walking up to root
+        self.prune_empty_branches(&path)?;
+
+        Ok(())
+    }
+
+    /// Remove a child from a branch and update its commitment
+    fn remove_child_from_branch(
+        &mut self,
+        branch_path: &[u8],
+        child_index: u8,
+        old_child_hash: Fr,
+    ) -> Result<(), DeleteError> {
+        let branch_meta = self
+            .storage
+            .get_branch_meta(branch_path)
+            .ok_or_else(|| DeleteError::BranchNotFound(branch_path.to_vec()))?;
+
+        // Remove child reference
+        self.storage.remove_branch_child(branch_path, child_index);
+
+        // Compute new commitment: subtract old_child_hash * G[child_index]
+        let delta = self.committer.scalar_mul(old_child_hash, child_index as usize);
+        let new_commitment = branch_meta.commitment - delta;
+        let new_hash_commitment = group_to_field(&new_commitment);
+
+        // Update branch
+        let new_meta = BranchMeta {
+            commitment: new_commitment,
+            hash_commitment: new_hash_commitment,
+        };
+
+        let depth = branch_path.len() as u8;
+        self.storage
+            .insert_branch(branch_path.to_vec(), new_meta, depth);
+
+        // Update parent if not root
+        if !branch_path.is_empty() {
+            let parent_path = &branch_path[..branch_path.len() - 1];
+            let parent_child_index = branch_path[branch_path.len() - 1];
+            self.update_parent_branch(
+                parent_path,
+                parent_child_index,
+                branch_meta.hash_commitment,
+                new_hash_commitment,
+            )?;
+        }
+
+        Ok(())
+    }
+
+    /// Prune branches that become empty after deletion
+    fn prune_empty_branches(&mut self, starting_path: &[u8]) -> Result<(), DeleteError> {
+        let mut current_path = starting_path.to_vec();
+
+        while !current_path.is_empty() {
+            let children = self.storage.get_branch_children(&current_path);
+
+            if children.is_empty() {
+                // Branch is empty, delete it
+                let branch_meta = self
+                    .storage
+                    .get_branch_meta(&current_path)
+                    .ok_or_else(|| DeleteError::BranchNotFound(current_path.clone()))?;
+
+                self.storage.delete_branch(&current_path);
+
+                // Remove from parent
+                let child_index = current_path.pop().unwrap();
+                self.remove_child_from_branch(
+                    &current_path,
+                    child_index,
+                    branch_meta.hash_commitment,
+                )?;
+            } else {
+                // Branch still has children, stop pruning
+                break;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Get the depth at which a stem exists in the tree
+    fn get_stem_depth(&self, stem: &[u8; 31]) -> u8 {
+        // Walk down from root finding the stem
+        for depth in 0..31u8 {
+            let path = &stem[..depth as usize];
+            let child_index = stem[depth as usize];
+
+            match self.storage.get_branch_child(path, child_index) {
+                Some(BranchChild::Stem(s)) if s == *stem => return depth,
+                Some(BranchChild::Branch(_)) => continue,
+                _ => return depth,
+            }
+        }
+        31
+    }
+
+    /// Update parent branch after stem commitment changes
+    fn update_parent_after_stem_change(
+        &mut self,
+        stem: &[u8; 31],
+        old_hash: Fr,
+        new_hash: Fr,
+        depth: u8,
+    ) -> Result<(), DeleteError> {
+        let path = stem[..depth as usize].to_vec();
+        let child_index = stem[depth as usize];
+
+        self.update_parent_branch(&path, child_index, old_hash, new_hash)
+    }
+
+    /// Update a parent branch when a child's commitment changes
+    fn update_parent_branch(
+        &mut self,
+        parent_path: &[u8],
+        child_index: u8,
+        old_child_hash: Fr,
+        new_child_hash: Fr,
+    ) -> Result<(), DeleteError> {
+        let parent_meta = self
+            .storage
+            .get_branch_meta(parent_path)
+            .ok_or_else(|| DeleteError::BranchNotFound(parent_path.to_vec()))?;
+
+        // Delta update: new = old + (new_hash - old_hash) * G[child_index]
+        let delta = new_child_hash - old_child_hash;
+        let delta_commitment = self.committer.scalar_mul(delta, child_index as usize);
+        let new_commitment = parent_meta.commitment + delta_commitment;
+        let new_hash_commitment = group_to_field(&new_commitment);
+
+        let new_meta = BranchMeta {
+            commitment: new_commitment,
+            hash_commitment: new_hash_commitment,
+        };
+
+        let depth = parent_path.len() as u8;
+        self.storage
+            .insert_branch(parent_path.to_vec(), new_meta, depth);
+
+        // Recursively update ancestors
+        if !parent_path.is_empty() {
+            let grandparent_path = &parent_path[..parent_path.len() - 1];
+            let parent_index = parent_path[parent_path.len() - 1];
+            self.update_parent_branch(
+                grandparent_path,
+                parent_index,
+                parent_meta.hash_commitment,
+                new_hash_commitment,
+            )?;
+        }
+
+        Ok(())
+    }
+}
 // Returns a list of all of the path indices where the two stems
 // are the same and the next path index where they both differ for each
 // stem.
@@ -1204,5 +1510,163 @@ mod tests {
         let _val = trie.get(tree_key_nonce).unwrap();
         let _val = trie.get(tree_key_code_keccak).unwrap();
         let _val = trie.get(tree_key_code_size).unwrap();
+    }
+
+    // Delete operation tests
+
+    #[test]
+    fn test_delete_existing_key() {
+        let db = MemoryDb::new();
+        let mut trie = Trie::new(DefaultConfig::new(db));
+
+        let key = [1u8; 32];
+        let value = [2u8; 32];
+
+        trie.insert_single(key, value);
+        let result = trie.delete(key);
+
+        assert_eq!(result, Ok(Some(value)));
+        assert_eq!(trie.get(key), None);
+    }
+
+    #[test]
+    fn test_delete_nonexistent_key() {
+        let db = MemoryDb::new();
+        let mut trie = Trie::new(DefaultConfig::new(db));
+
+        let key = [1u8; 32];
+        let result = trie.delete(key);
+
+        assert_eq!(result, Ok(None));
+    }
+
+    #[test]
+    fn test_delete_updates_root() {
+        let db = MemoryDb::new();
+        let mut trie = Trie::new(DefaultConfig::new(db));
+
+        let key = [1u8; 32];
+        let value = [2u8; 32];
+
+        trie.insert_single(key, value);
+        let root_before = trie.root_commitment();
+
+        trie.delete(key).unwrap();
+        let root_after = trie.root_commitment();
+
+        assert_ne!(root_before, root_after);
+    }
+
+    #[test]
+    fn test_delete_last_key_removes_stem() {
+        let db = MemoryDb::new();
+        let mut trie = Trie::new(DefaultConfig::new(db));
+
+        let key = [1u8; 32];
+        let stem: [u8; 31] = key[..31].try_into().unwrap();
+
+        trie.insert_single(key, [2u8; 32]);
+        assert!(trie.storage.get_stem_meta(stem).is_some());
+
+        trie.delete(key).unwrap();
+        assert!(trie.storage.get_stem_meta(stem).is_none());
+    }
+
+    #[test]
+    fn test_delete_partial_stem() {
+        let db = MemoryDb::new();
+        let mut trie = Trie::new(DefaultConfig::new(db));
+
+        // Two keys with same stem, different suffix
+        let mut key1 = [1u8; 32];
+        let mut key2 = [1u8; 32];
+        key1[31] = 0;
+        key2[31] = 1;
+
+        let stem: [u8; 31] = key1[..31].try_into().unwrap();
+
+        trie.insert_single(key1, [2u8; 32]);
+        trie.insert_single(key2, [3u8; 32]);
+
+        trie.delete(key1).unwrap();
+
+        // Stem should still exist with key2
+        assert!(trie.storage.get_stem_meta(stem).is_some());
+        assert_eq!(trie.get(key2), Some([3u8; 32]));
+    }
+
+    #[test]
+    fn test_delete_reinsert_same_root() {
+        let db = MemoryDb::new();
+        let mut trie = Trie::new(DefaultConfig::new(db));
+
+        let key = [1u8; 32];
+        let value = [2u8; 32];
+
+        trie.insert_single(key, value);
+        let root_with_key = trie.root_commitment();
+
+        trie.delete(key).unwrap();
+        trie.insert_single(key, value);
+        let root_after_reinsert = trie.root_commitment();
+
+        assert_eq!(root_with_key, root_after_reinsert);
+    }
+
+    #[test]
+    fn test_delete_to_empty_trie() {
+        let db = MemoryDb::new();
+        let mut trie = Trie::new(DefaultConfig::new(db));
+
+        let empty_root = trie.root_hash();
+
+        let key = [0u8; 32];
+        let value = [1u8; 32];
+
+        trie.insert_single(key, value);
+        trie.delete(key).unwrap();
+
+        // After deleting the only key, root should be back to empty state
+        assert_eq!(trie.root_hash(), empty_root);
+    }
+
+    #[test]
+    fn test_delete_c2_suffix() {
+        // Test deleting a key with suffix >= 128 (uses C2 commitment)
+        let db = MemoryDb::new();
+        let mut trie = Trie::new(DefaultConfig::new(db));
+
+        let mut key = [1u8; 32];
+        key[31] = 200; // suffix >= 128, uses C2
+        let value = [2u8; 32];
+
+        trie.insert_single(key, value);
+        let result = trie.delete(key);
+
+        assert_eq!(result, Ok(Some(value)));
+        assert_eq!(trie.get(key), None);
+    }
+
+    #[test]
+    fn test_delete_multiple_stems() {
+        let db = MemoryDb::new();
+        let mut trie = Trie::new(DefaultConfig::new(db));
+
+        let key1 = [0u8; 32];
+        let key2 = [1u8; 32];
+
+        trie.insert_single(key1, [1u8; 32]);
+        trie.insert_single(key2, [2u8; 32]);
+
+        // Delete first key
+        trie.delete(key1).unwrap();
+
+        // Second key should still exist
+        assert_eq!(trie.get(key2), Some([2u8; 32]));
+        assert_eq!(trie.get(key1), None);
+
+        // Delete second key
+        trie.delete(key2).unwrap();
+        assert_eq!(trie.get(key2), None);
     }
 }

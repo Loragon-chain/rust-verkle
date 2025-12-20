@@ -257,7 +257,7 @@ impl<S: BareMetalKVDb> ReadOnlyHigherDb for VerkleDb<S> {
 }
 
 // Always save in the permanent storage and only save in the memorydb if the depth is <= cache depth
-impl<S> WriteOnlyHigherDb for VerkleDb<S> {
+impl<S: BareMetalKVDb> WriteOnlyHigherDb for VerkleDb<S> {
     fn insert_leaf(&mut self, key: [u8; 32], value: [u8; 32], depth: u8) -> Option<Vec<u8>> {
         if depth <= CACHE_DEPTH {
             self.cache.insert_leaf(key, value, depth);
@@ -291,6 +291,57 @@ impl<S> WriteOnlyHigherDb for VerkleDb<S> {
             self.cache.insert_branch(key.clone(), meta, depth);
         }
         self.batch.insert_branch(key, meta, depth)
+    }
+
+    fn delete_leaf(&mut self, key: [u8; 32]) -> Option<[u8; 32]> {
+        // Try cache first, then batch, then storage
+        // We need to check all layers and return the most recent value
+        let cache_val = self.cache.delete_leaf(key);
+        let batch_val = self.batch.delete_leaf(key);
+
+        // Return the value from the most recent layer that had it
+        // Priority: cache > batch > storage
+        if cache_val.is_some() {
+            return cache_val;
+        }
+        if batch_val.is_some() {
+            return batch_val;
+        }
+        // For storage, we just get the value (actual deletion happens on flush)
+        // We mark for deletion by not having it in batch after this
+        self.storage.get_leaf(key)
+    }
+
+    fn delete_stem(&mut self, stem: [u8; 31]) -> Option<StemMeta> {
+        let cache_val = self.cache.delete_stem(stem);
+        let batch_val = self.batch.delete_stem(stem);
+
+        if cache_val.is_some() {
+            return cache_val;
+        }
+        if batch_val.is_some() {
+            return batch_val;
+        }
+        self.storage.get_stem_meta(stem)
+    }
+
+    fn delete_branch(&mut self, path: &[u8]) -> Option<BranchMeta> {
+        let cache_val = self.cache.delete_branch(path);
+        let batch_val = self.batch.delete_branch(path);
+
+        if cache_val.is_some() {
+            return cache_val;
+        }
+        if batch_val.is_some() {
+            return batch_val;
+        }
+        self.storage.get_branch_meta(path)
+    }
+
+    fn remove_branch_child(&mut self, branch_path: &[u8], child_index: u8) {
+        self.cache.remove_branch_child(branch_path, child_index);
+        self.batch.remove_branch_child(branch_path, child_index);
+        // Storage deletion happens implicitly when the data is not in batch on flush
     }
 }
 

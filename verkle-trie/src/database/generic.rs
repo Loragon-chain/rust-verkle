@@ -59,6 +59,26 @@ impl<T: BatchWriter> WriteOnlyHigherDb for GenericBatchWriter<T> {
             .batch_put(&labelled_key, &meta.to_bytes().unwrap());
         None
     }
+
+    fn delete_leaf(&mut self, _key: [u8; 32]) -> Option<[u8; 32]> {
+        // BatchWriter only writes, cannot read previous values
+        // Deletion is handled by not writing the key in the batch
+        None
+    }
+
+    fn delete_stem(&mut self, _stem: [u8; 31]) -> Option<StemMeta> {
+        // BatchWriter only writes, cannot read previous values
+        None
+    }
+
+    fn delete_branch(&mut self, _path: &[u8]) -> Option<BranchMeta> {
+        // BatchWriter only writes, cannot read previous values
+        None
+    }
+
+    fn remove_branch_child(&mut self, _branch_path: &[u8], _child_index: u8) {
+        // BatchWriter only writes, deletion is handled by not writing
+    }
 }
 
 // This struct allows us to provide a default implementation of ReadOnlyHigherDB to

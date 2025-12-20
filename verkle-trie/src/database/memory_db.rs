@@ -139,6 +139,28 @@ impl WriteOnlyHigherDb for MemoryDb {
         self.branch_table
             .insert(branch_child_id, BranchChild::Stem(stem_id))
     }
+
+    fn delete_leaf(&mut self, key: [u8; 32]) -> Option<[u8; 32]> {
+        self.leaf_table.remove(&key)
+    }
+
+    fn delete_stem(&mut self, stem: [u8; 31]) -> Option<StemMeta> {
+        self.stem_table.remove(&stem)
+    }
+
+    fn delete_branch(&mut self, path: &[u8]) -> Option<BranchMeta> {
+        match self.branch_table.remove(&path.to_vec()) {
+            Some(BranchChild::Branch(meta)) => Some(meta),
+            Some(BranchChild::Stem(_)) => None,
+            None => None,
+        }
+    }
+
+    fn remove_branch_child(&mut self, branch_path: &[u8], child_index: u8) {
+        let mut child_key = branch_path.to_vec();
+        child_key.push(child_index);
+        self.branch_table.remove(&child_key);
+    }
 }
 
 impl Flush for MemoryDb {

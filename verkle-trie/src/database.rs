@@ -44,6 +44,18 @@ pub trait WriteOnlyHigherDb {
     // TODO maybe we can return BranchChild, as the previous data could have been a stem or branch_meta
     // TODO then we can leave it upto the caller on how to deal with it
     fn insert_branch(&mut self, key: Vec<u8>, meta: BranchMeta, _depth: u8) -> Option<BranchMeta>;
+
+    /// Remove a leaf, returning the old value if it existed
+    fn delete_leaf(&mut self, key: [u8; 32]) -> Option<[u8; 32]>;
+
+    /// Remove a stem, returning the old metadata if it existed
+    fn delete_stem(&mut self, stem: [u8; 31]) -> Option<StemMeta>;
+
+    /// Remove a branch node, returning the old metadata if it existed
+    fn delete_branch(&mut self, path: &[u8]) -> Option<BranchMeta>;
+
+    /// Remove a child reference from a branch node
+    fn remove_branch_child(&mut self, branch_path: &[u8], child_index: u8);
 }
 
 // Notice that these take self, which effectively forces the implementer

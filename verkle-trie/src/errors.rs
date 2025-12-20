@@ -45,3 +45,15 @@ pub enum ProofCreationError {
     #[error("Expected to have atleast one query, which will be against the root")]
     ExpectedOneQueryAgainstRoot,
 }
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum DeleteError {
+    #[error("Stem not found for key: {0:?}")]
+    StemNotFound([u8; 31]),
+
+    #[error("Branch not found at path: {0:?}")]
+    BranchNotFound(Vec<u8>),
+
+    #[error("Failed to update commitment: {0}")]
+    CommitmentUpdateFailed(String),
+}
