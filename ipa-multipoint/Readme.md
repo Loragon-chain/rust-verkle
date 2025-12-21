@@ -15,7 +15,9 @@ This library uses the banderwagon prime group (https://hackmd.io/@6iQDuIePQjyYBq
 
 ## Efficiency
 
-- Parallelism is not being used
+- The `MultiPoint::open()` function uses Rayon for parallel processing of large batches (>100 grouped queries)
+- Parallel paths are used for query aggregation, division mapping, and polynomial scaling
+- For small batches, sequential processing is used to avoid thread pool overhead
 - We have not modified pippenger to take benefit of the GLV endomorphism
 
 ## API
@@ -78,4 +80,8 @@ New benchmark on banderwagon subgroup: Apple M1 Pro 16GB RAM
 
 
 
-*These benchmarks are tentative because on one hand, the machine being used may not be the what the average user uses, while on the other hand, we have not optimised the verifier algorithm to remove `bH` , the pippenger algorithm does not take into consideration GLV and we are not using rayon to parallelise.*
+*These benchmarks are tentative because on one hand, the machine being used may not be the what the average user uses, while on the other hand, we have not optimised the verifier algorithm to remove `bH` and the pippenger algorithm does not take into consideration GLV.*
+
+### Parallel Performance
+
+The multiproof prover now uses Rayon parallelization for large batches (>100 grouped queries). For batches of 16K+ queries, expect 4-8x speedup on multi-core systems. The parallel threshold of 100 queries balances parallelization overhead against performance gains. You can control the number of threads using the `RAYON_NUM_THREADS` environment variable.

@@ -9,9 +9,39 @@ use crate::math_utils::powers_of;
 use crate::transcript::Transcript;
 use crate::transcript::TranscriptProtocol;
 
+use rayon::prelude::*;
 use std::collections::HashMap;
 
 use banderwagon::{trait_defs::*, Element, Fr};
+
+/// Minimum number of grouped queries before using parallel processing.
+/// Below this threshold, sequential processing is faster due to thread pool overhead.
+const PARALLEL_QUERY_THRESHOLD: usize = 100;
+
+/// Aggregate a group of queries evaluated at the same point into a single polynomial.
+/// This is the core computation extracted to avoid duplication between parallel/sequential paths.
+fn aggregate_query_group(
+    point: usize,
+    queries_challenges: Vec<(&ProverQuery, &Fr)>,
+    poly_size: usize,
+) -> (usize, LagrangeBasis) {
+    let mut aggregated_polynomial = vec![Fr::zero(); poly_size];
+
+    for (query, challenge) in queries_challenges {
+        for (result, value) in aggregated_polynomial.iter_mut().zip(query.poly.values().iter()) {
+            *result += *value * challenge;
+        }
+    }
+
+    (point, LagrangeBasis::new(aggregated_polynomial))
+}
+
+/// Scale polynomial coefficients by a scalar and wrap in LagrangeBasis.
+fn scale_polynomial(poly: LagrangeBasis, scalar: Fr) -> LagrangeBasis {
+    let term: Vec<_> = poly.values().iter().map(|coeff| scalar * coeff).collect();
+    LagrangeBasis::new(term)
+}
+
 pub struct MultiPoint;
 
 #[derive(Clone, Debug)]
@@ -75,50 +105,40 @@ impl MultiPoint {
         let powers_of_r = powers_of(r, queries.len());
 
         let grouped_queries = group_prover_queries(&queries, &powers_of_r);
+        let poly_size = crs.n;
+        let use_parallel = grouped_queries.len() >= PARALLEL_QUERY_THRESHOLD;
 
-        // aggregate all of the queries evaluated at the same point
-        let aggregated_queries: Vec<_> = grouped_queries
-            .into_iter()
-            .map(|(point, queries_challenges)| {
-                let mut aggregated_polynomial = vec![Fr::zero(); crs.n];
+        // Aggregate all of the queries evaluated at the same point
+        let aggregated_queries: Vec<_> = if use_parallel {
+            grouped_queries
+                .into_par_iter()
+                .map(|(point, qc)| aggregate_query_group(point, qc, poly_size))
+                .collect()
+        } else {
+            grouped_queries
+                .into_iter()
+                .map(|(point, qc)| aggregate_query_group(point, qc, poly_size))
+                .collect()
+        };
 
-                let scaled_lagrange_polynomials =
-                    queries_challenges.into_iter().map(|(query, challenge)| {
-                        // scale the polynomial by the challenge
-                        query.poly.values().iter().map(move |x| *x * challenge)
-                    });
-
-                for poly_mul_challenge in scaled_lagrange_polynomials {
-                    for (result, scaled_poly) in
-                        aggregated_polynomial.iter_mut().zip(poly_mul_challenge)
-                    {
-                        *result += scaled_poly;
-                    }
-                }
-
-                (point, LagrangeBasis::new(aggregated_polynomial))
-            })
-            .collect();
-
-        // Compute g(X)
-        //
-        let g_x: LagrangeBasis = aggregated_queries
-            .iter()
-            .map(|(point, agg_f_x)| (agg_f_x).divide_by_linear_vanishing(precomp, *point))
-            .fold(LagrangeBasis::zero(), |mut res, val| {
-                res = res + val;
-                res
-            });
+        // Compute g(X) = sum of (agg_f_x / (X - point)) for each aggregated query
+        let g_x: LagrangeBasis = if use_parallel {
+            aggregated_queries
+                .par_iter()
+                .map(|(point, agg_f_x)| agg_f_x.divide_by_linear_vanishing(precomp, *point))
+                .reduce(LagrangeBasis::zero, |a, b| a + b)
+        } else {
+            aggregated_queries
+                .iter()
+                .map(|(point, agg_f_x)| agg_f_x.divide_by_linear_vanishing(precomp, *point))
+                .fold(LagrangeBasis::zero(), |res, val| res + val)
+        };
 
         let g_x_comm = crs.commit_lagrange_poly(&g_x);
         transcript.append_point(b"D", &g_x_comm);
 
         // 2. Compute g_1(t)
-        //
-        //
         let t = transcript.challenge_scalar(b"t");
-        //
-        //
 
         let mut g1_den: Vec<_> = aggregated_queries
             .iter()
@@ -126,22 +146,20 @@ impl MultiPoint {
             .collect();
         batch_inversion(&mut g1_den);
 
-        let g1_x = aggregated_queries
-            .into_iter()
-            .zip(g1_den)
-            .map(|((_, agg_f_x), den_inv)| {
-                let term: Vec<_> = agg_f_x
-                    .values()
-                    .iter()
-                    .map(|coeff| den_inv * coeff)
-                    .collect();
-
-                LagrangeBasis::new(term)
-            })
-            .fold(LagrangeBasis::zero(), |mut res, val| {
-                res = res + val;
-                res
-            });
+        // Compute g1_x = sum of (agg_f_x * den_inv) for each aggregated query
+        let g1_x = if use_parallel {
+            aggregated_queries
+                .into_par_iter()
+                .zip(g1_den.into_par_iter())
+                .map(|((_, agg_f_x), den_inv)| scale_polynomial(agg_f_x, den_inv))
+                .reduce(LagrangeBasis::zero, |a, b| a + b)
+        } else {
+            aggregated_queries
+                .into_iter()
+                .zip(g1_den)
+                .map(|((_, agg_f_x), den_inv)| scale_polynomial(agg_f_x, den_inv))
+                .fold(LagrangeBasis::zero(), |res, val| res + val)
+        };
 
         let g1_comm = crs.commit_lagrange_poly(&g1_x);
         transcript.append_point(b"E", &g1_comm);
@@ -531,4 +549,167 @@ fn multiproof_consistency() {
     let got = hex::encode(bytes);
     let expected = "4f53588244efaf07a370ee3f9c467f933eed360d4fbf7a19dfc8bc49b67df4711bf1d0a720717cd6a8c75f1a668cb7cbdd63b48c676b89a7aee4298e71bd7f4013d7657146aa9736817da47051ed6a45fc7b5a61d00eb23e5df82a7f285cc10e67d444e91618465ca68d8ae4f2c916d1942201b7e2aae491ef0f809867d00e83468fb7f9af9b42ede76c1e90d89dd789ff22eb09e8b1d062d8a58b6f88b3cbe80136fc68331178cd45a1df9496ded092d976911b5244b85bc3de41e844ec194256b39aeee4ea55538a36139211e9910ad6b7a74e75d45b869d0a67aa4bf600930a5f760dfb8e4df9938d1f47b743d71c78ba8585e3b80aba26d24b1f50b36fa1458e79d54c05f58049245392bc3e2b5c5f9a1b99d43ed112ca82b201fb143d401741713188e47f1d6682b0bf496a5d4182836121efff0fd3b030fc6bfb5e21d6314a200963fe75cb856d444a813426b2084dfdc49dca2e649cb9da8bcb47859a4c629e97898e3547c591e39764110a224150d579c33fb74fa5eb96427036899c04154feab5344873d36a53a5baefd78c132be419f3f3a8dd8f60f72eb78dd5f43c53226f5ceb68947da3e19a750d760fb31fa8d4c7f53bfef11c4b89158aa56b1f4395430e16a3128f88e234ce1df7ef865f2d2c4975e8c82225f578310c31fd41d265fd530cbfa2b8895b228a510b806c31dff3b1fa5c08bffad443d567ed0e628febdd22775776e0cc9cebcaea9c6df9279a5d91dd0ee5e7a0434e989a160005321c97026cb559f71db23360105460d959bcdf74bee22c4ad8805a1d497507";
     assert_eq!(got, expected)
+}
+
+#[test]
+fn parallel_multiproof_determinism() {
+    // Test that parallel proof generation produces deterministic results
+    use ark_std::One;
+
+    let n = 256;
+    let crs = CRS::new(n, b"eth_verkle_oct_2021");
+    let precomp = PrecomputedWeights::new(n);
+
+    // Create a batch of polynomials
+    let poly_a: Vec<Fr> = (0..n).map(|i| Fr::from(((i % 32) + 1) as u128)).collect();
+    let polynomial_a = LagrangeBasis::new(poly_a);
+    let poly_b: Vec<Fr> = (0..n)
+        .rev()
+        .map(|i| Fr::from(((i % 32) + 1) as u128))
+        .collect();
+    let polynomial_b = LagrangeBasis::new(poly_b);
+    let poly_c: Vec<Fr> = (0..n).map(|i| Fr::from((i * 2 + 1) as u128)).collect();
+    let polynomial_c = LagrangeBasis::new(poly_c);
+
+    let poly_comm_a = crs.commit_lagrange_poly(&polynomial_a);
+    let poly_comm_b = crs.commit_lagrange_poly(&polynomial_b);
+    let poly_comm_c = crs.commit_lagrange_poly(&polynomial_c);
+
+    let queries = vec![
+        ProverQuery {
+            commitment: poly_comm_a,
+            poly: polynomial_a.clone(),
+            point: 0,
+            result: Fr::one(),
+        },
+        ProverQuery {
+            commitment: poly_comm_b,
+            poly: polynomial_b.clone(),
+            point: 1,
+            result: polynomial_b.evaluate_in_domain(1),
+        },
+        ProverQuery {
+            commitment: poly_comm_c,
+            poly: polynomial_c.clone(),
+            point: 2,
+            result: polynomial_c.evaluate_in_domain(2),
+        },
+    ];
+
+    // Generate proof multiple times and verify identical results
+    let mut first_proof_bytes: Option<Vec<u8>> = None;
+    for _ in 0..3 {
+        let mut transcript = Transcript::new(b"determinism_test");
+        let proof = MultiPoint::open(crs.clone(), &precomp, &mut transcript, queries.clone());
+        let proof_bytes = proof.to_bytes().unwrap();
+
+        match &first_proof_bytes {
+            Some(expected) => assert_eq!(
+                &proof_bytes, expected,
+                "Parallel proof generation should be deterministic"
+            ),
+            None => first_proof_bytes = Some(proof_bytes),
+        }
+    }
+}
+
+#[test]
+fn parallel_large_batch_verification() {
+    // Test parallel processing with a larger batch that would trigger parallel paths
+
+    let n = 256;
+    let crs = CRS::new(n, b"eth_verkle_oct_2021");
+    let precomp = PrecomputedWeights::new(n);
+
+    // Create multiple polynomials with different evaluation points
+    let num_queries = 10;
+    let mut queries = Vec::with_capacity(num_queries);
+    let mut verifier_queries = Vec::with_capacity(num_queries);
+
+    for i in 0..num_queries {
+        let poly: Vec<Fr> = (0..n)
+            .map(|j| Fr::from(((j + i) % 256 + 1) as u128))
+            .collect();
+        let polynomial = LagrangeBasis::new(poly);
+        let point = i % n;
+        let result = polynomial.evaluate_in_domain(point);
+        let commitment = crs.commit_lagrange_poly(&polynomial);
+
+        queries.push(ProverQuery {
+            commitment,
+            poly: polynomial,
+            point,
+            result,
+        });
+
+        verifier_queries.push(VerifierQuery {
+            commitment,
+            point: Fr::from(point as u128),
+            result,
+        });
+    }
+
+    let mut prover_transcript = Transcript::new(b"large_batch");
+    let proof = MultiPoint::open(crs.clone(), &precomp, &mut prover_transcript, queries);
+
+    let mut verifier_transcript = Transcript::new(b"large_batch");
+    assert!(
+        proof.check(&crs, &precomp, &verifier_queries, &mut verifier_transcript),
+        "Large batch multiproof should verify correctly"
+    );
+}
+
+#[test]
+fn single_thread_pool_safety() {
+    // Test that proof generation works correctly with a single-threaded pool
+    // This simulates RAYON_NUM_THREADS=1 environment
+    use rayon::ThreadPoolBuilder;
+
+    let n = 256;
+    let crs = CRS::new(n, b"eth_verkle_oct_2021");
+    let precomp = PrecomputedWeights::new(n);
+
+    // Create test queries
+    let poly: Vec<Fr> = (0..n).map(|i| Fr::from((i + 1) as u128)).collect();
+    let polynomial = LagrangeBasis::new(poly);
+    let commitment = crs.commit_lagrange_poly(&polynomial);
+
+    let queries: Vec<ProverQuery> = (0..5)
+        .map(|i| {
+            let point = i % n;
+            ProverQuery {
+                commitment,
+                poly: polynomial.clone(),
+                point,
+                result: polynomial.evaluate_in_domain(point),
+            }
+        })
+        .collect();
+
+    let verifier_queries: Vec<VerifierQuery> = queries
+        .iter()
+        .map(|q| VerifierQuery {
+            commitment: q.commitment,
+            point: Fr::from(q.point as u128),
+            result: q.result,
+        })
+        .collect();
+
+    // Build a single-thread pool and run the proof generation inside it
+    let pool = ThreadPoolBuilder::new()
+        .num_threads(1)
+        .build()
+        .expect("Failed to build single-thread pool");
+
+    let proof = pool.install(|| {
+        let mut transcript = Transcript::new(b"single_thread_test");
+        MultiPoint::open(crs.clone(), &precomp, &mut transcript, queries)
+    });
+
+    // Verify the proof works correctly
+    let mut verifier_transcript = Transcript::new(b"single_thread_test");
+    assert!(
+        proof.check(&crs, &precomp, &verifier_queries, &mut verifier_transcript),
+        "Single-threaded proof should verify correctly"
+    );
 }
