@@ -9,3 +9,9 @@ Cargo.lock
 bin
 obj
 
+
+# Simple Task Master - User tasks are git-ignored
+.simple-task-master
+.simple-task-master/lock
+.claude
+specs/
