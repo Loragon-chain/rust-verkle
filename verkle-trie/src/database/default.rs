@@ -71,11 +71,8 @@ impl<S: BareMetalKVDb> VerkleDb<S> {
                             if let Some(stem_meta) = self.storage.get_stem_meta(stem_id) {
                                 self.cache.insert_stem(stem_id, stem_meta, child_depth);
                             }
-                            self.cache.add_stem_as_branch_child(
-                                child_path,
-                                stem_id,
-                                child_depth,
-                            );
+                            self.cache
+                                .add_stem_as_branch_child(child_path, stem_id, child_depth);
                         }
                         BranchChild::Branch(branch_meta) => {
                             // Cache branch and add to queue for further traversal

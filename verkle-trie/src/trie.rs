@@ -899,7 +899,9 @@ impl<Storage: ReadWriteHigherDb, PolyCommit: Committer> Trie<Storage, PolyCommit
         self.storage.remove_branch_child(branch_path, child_index);
 
         // Compute new commitment: subtract old_child_hash * G[child_index]
-        let delta = self.committer.scalar_mul(old_child_hash, child_index as usize);
+        let delta = self
+            .committer
+            .scalar_mul(old_child_hash, child_index as usize);
         let new_commitment = branch_meta.commitment - delta;
         let new_hash_commitment = group_to_field(&new_commitment);
 
@@ -1042,7 +1044,6 @@ pub struct ParallelInsertConfig {
     /// Use parallel processing regardless of batch size
     pub force_parallel: bool,
 }
-
 
 /// Grouped entries for a stem that can be processed together
 #[derive(Debug)]
@@ -1805,7 +1806,10 @@ mod tests {
         trie2.insert_parallel(entries);
         let root2 = trie2.root_hash();
 
-        assert_eq!(root1, root2, "Parallel and sequential insert should produce same root");
+        assert_eq!(
+            root1, root2,
+            "Parallel and sequential insert should produce same root"
+        );
     }
 
     #[test]
@@ -1852,7 +1856,12 @@ mod tests {
         // Parallel (forced even though below threshold)
         let db2 = MemoryDb::new();
         let mut trie2 = Trie::new(DefaultConfig::new(db2));
-        trie2.insert_parallel_with_config(entries.clone(), super::ParallelInsertConfig { force_parallel: true });
+        trie2.insert_parallel_with_config(
+            entries.clone(),
+            super::ParallelInsertConfig {
+                force_parallel: true,
+            },
+        );
 
         assert_eq!(
             trie1.root_hash(),
@@ -1907,7 +1916,11 @@ mod tests {
         let empty_root = trie.root_hash();
         trie.insert_parallel(vec![]);
 
-        assert_eq!(trie.root_hash(), empty_root, "Empty insert should not change root");
+        assert_eq!(
+            trie.root_hash(),
+            empty_root,
+            "Empty insert should not change root"
+        );
     }
 
     #[test]
@@ -1939,7 +1952,12 @@ mod tests {
         // Parallel (forced)
         let db2 = MemoryDb::new();
         let mut trie2 = Trie::new(DefaultConfig::new(db2));
-        trie2.insert_parallel_with_config(entries.clone(), super::ParallelInsertConfig { force_parallel: true });
+        trie2.insert_parallel_with_config(
+            entries.clone(),
+            super::ParallelInsertConfig {
+                force_parallel: true,
+            },
+        );
 
         assert_eq!(
             trie1.root_hash(),

@@ -53,12 +53,10 @@ impl CRS {
     #[allow(non_snake_case)]
     // The last element is implied to be `Q`
     pub fn from_bytes(bytes: &[[u8; 64]]) -> Result<CRS, CRSError> {
-        let (q_bytes, g_vec_bytes) = bytes
-            .split_last()
-            .ok_or_else(|| CRSError::InvalidLength {
-                expected: 1,
-                actual: 0,
-            })?;
+        let (q_bytes, g_vec_bytes) = bytes.split_last().ok_or_else(|| CRSError::InvalidLength {
+            expected: 1,
+            actual: 0,
+        })?;
 
         let Q = Element::try_from_bytes_uncompressed(*q_bytes).map_err(|e| {
             CRSError::PointDeserializationError {
@@ -237,7 +235,10 @@ mod error_handling_tests {
         let result = CRS::from_bytes(&[]);
         assert!(matches!(
             result,
-            Err(CRSError::InvalidLength { expected: 1, actual: 0 })
+            Err(CRSError::InvalidLength {
+                expected: 1,
+                actual: 0
+            })
         ));
     }
 

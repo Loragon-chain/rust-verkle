@@ -28,7 +28,10 @@ fn aggregate_query_group(
     let mut aggregated_polynomial = vec![Fr::zero(); poly_size];
 
     for (query, challenge) in queries_challenges {
-        for (result, value) in aggregated_polynomial.iter_mut().zip(query.poly.values().iter()) {
+        for (result, value) in aggregated_polynomial
+            .iter_mut()
+            .zip(query.poly.values().iter())
+        {
             *result += *value * challenge;
         }
     }

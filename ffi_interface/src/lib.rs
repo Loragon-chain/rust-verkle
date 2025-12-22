@@ -10,11 +10,11 @@ pub use serialization::{
 use banderwagon::Element;
 use banderwagon::Fr;
 use ipa_multipoint::committer::{Committer, DefaultCommitter};
-use rayon::prelude::*;
 use ipa_multipoint::crs::CRS;
 use ipa_multipoint::lagrange_basis::PrecomputedWeights;
 use ipa_multipoint::multiproof::{MultiPoint, MultiPointProof, ProverQuery, VerifierQuery};
 use ipa_multipoint::transcript::Transcript;
+use rayon::prelude::*;
 pub use serialization::{fr_from_le_bytes, fr_to_le_bytes};
 use verkle_trie::proof::golang_proof_format::{bytes32_to_element, hex_to_bytes32, VerkleProofGo};
 
@@ -831,13 +831,19 @@ mod parallel_hash_tests {
         let small_batch = create_test_commitments(50);
         let result1 = hash_commitments(&small_batch);
         let result2 = hash_commitments_sequential(&small_batch);
-        assert_eq!(result1, result2, "Small batch should use sequential implementation");
+        assert_eq!(
+            result1, result2,
+            "Small batch should use sequential implementation"
+        );
 
         // At or above threshold (>= 100): should use parallel
         let large_batch = create_test_commitments(150);
         let result3 = hash_commitments(&large_batch);
         let result4 = hash_commitments_impl_parallel(&large_batch);
-        assert_eq!(result3, result4, "Large batch should use parallel implementation");
+        assert_eq!(
+            result3, result4,
+            "Large batch should use parallel implementation"
+        );
     }
 
     #[test]
@@ -899,10 +905,8 @@ mod parallel_hash_tests {
         let commitments = create_test_commitments(10);
 
         let batch_results = hash_commitments(&commitments);
-        let individual_results: Vec<ScalarBytes> = commitments
-            .iter()
-            .map(|c| hash_commitment(*c))
-            .collect();
+        let individual_results: Vec<ScalarBytes> =
+            commitments.iter().map(|c| hash_commitment(*c)).collect();
 
         assert_eq!(
             batch_results, individual_results,
