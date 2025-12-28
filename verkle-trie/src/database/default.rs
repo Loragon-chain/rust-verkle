@@ -425,12 +425,7 @@ mod rocksdb_loading_tests {
     }
 
     /// Test: Cache contains root after load
-    ///
-    /// Note: Currently skipped due to deserialization issues in populate_cache_from_storage
-    /// when reloading from disk. The stem metadata format during BFS traversal needs
-    /// further investigation.
     #[test]
-    #[ignore]
     fn test_cache_populated_to_depth() {
         let temp_dir = TempDir::new().unwrap();
         let path = temp_dir.path().to_path_buf();
@@ -459,11 +454,7 @@ mod rocksdb_loading_tests {
     }
 
     /// Test: Get operation works after reload
-    ///
-    /// Note: Currently skipped due to deserialization issues in populate_cache_from_storage
-    /// when reloading from disk.
     #[test]
-    #[ignore]
     fn test_get_after_reload() {
         let temp_dir = TempDir::new().unwrap();
         let path = temp_dir.path().to_path_buf();
@@ -490,11 +481,7 @@ mod rocksdb_loading_tests {
     }
 
     /// Test: Proof generation works after reload
-    ///
-    /// Note: Currently skipped due to deserialization issues in populate_cache_from_storage
-    /// when reloading from disk.
     #[test]
-    #[ignore]
     fn test_proof_after_reload() {
         let temp_dir = TempDir::new().unwrap();
         let path = temp_dir.path().to_path_buf();
@@ -518,5 +505,226 @@ mod rocksdb_loading_tests {
 
         let proof = trie.create_verkle_proof(vec![key].into_iter());
         assert!(proof.is_ok());
+    }
+
+    /// Test: Multiple inserts, flush, and reopen - the original bug scenario
+    ///
+    /// This test reproduces the bug where BranchChild deserialization failed
+    /// after reopening a persisted database. The issue was:
+    /// 1. BranchMeta::from_bytes() had wrong validation: `!len == 96` instead of `len != 96`
+    /// 2. BranchChild serialization didn't include a type discriminator tag
+    #[test]
+    fn test_database_persistence_roundtrip() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().to_path_buf();
+
+        // Store the root hash for comparison
+        let expected_root_hash: [u8; 32];
+
+        // Phase 1: Create trie, insert multiple keys, flush to disk
+        {
+            let db = VerkleDb::<RocksDb>::from_path(&path);
+            let config = DefaultConfig::new(db);
+            let mut trie = crate::trie::Trie::new(config);
+
+            // Insert multiple keys to create a non-trivial trie structure
+            // with both stems and branches
+            for i in 0..20u8 {
+                let mut key = [0u8; 32];
+                key[0] = i;
+                key[31] = i;
+                let value = [i; 32];
+                trie.insert_single(key, value);
+            }
+
+            // Get the root hash before flush
+            let root = trie.root_hash();
+            use banderwagon::trait_defs::*;
+            let mut root_bytes = [0u8; 32];
+            root.serialize_compressed(&mut root_bytes[..]).unwrap();
+            expected_root_hash = root_bytes;
+
+            // Flush to disk
+            trie.storage.flush();
+        }
+
+        // Small delay to ensure RocksDB has flushed to disk
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        // Phase 2: Reopen database - this is where the bug used to trigger
+        // The populate_cache_from_storage() call would panic on BranchChild::from_bytes()
+        let db = VerkleDb::<RocksDb>::from_path(&path);
+        let config = DefaultConfig::new(db);
+        let trie = crate::trie::Trie::new(config);
+
+        // Verify root hash matches
+        let root = trie.root_hash();
+        use banderwagon::trait_defs::*;
+        let mut root_bytes = [0u8; 32];
+        root.serialize_compressed(&mut root_bytes[..]).unwrap();
+        assert_eq!(root_bytes, expected_root_hash, "Root hash should match after reopen");
+
+        // Verify we can retrieve all inserted values
+        for i in 0..20u8 {
+            let mut key = [0u8; 32];
+            key[0] = i;
+            key[31] = i;
+            let expected_value = [i; 32];
+
+            let retrieved = trie.get(key);
+            assert_eq!(
+                retrieved,
+                Some(expected_value),
+                "Value for key {} should be retrievable after reopen",
+                i
+            );
+        }
+    }
+
+    /// Test: Insert keys with same stem prefix to create stem nodes
+    #[test]
+    fn test_persistence_with_stem_nodes() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().to_path_buf();
+
+        // Phase 1: Create trie with keys that share stem prefix
+        {
+            let db = VerkleDb::<RocksDb>::from_path(&path);
+            let config = DefaultConfig::new(db);
+            let mut trie = crate::trie::Trie::new(config);
+
+            // Keys with same first 31 bytes (same stem) but different last byte
+            let stem_prefix = [42u8; 31];
+            for suffix in 0..5u8 {
+                let mut key = [0u8; 32];
+                key[..31].copy_from_slice(&stem_prefix);
+                key[31] = suffix;
+                let value = [suffix; 32];
+                trie.insert_single(key, value);
+            }
+
+            trie.storage.flush();
+        }
+
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        // Phase 2: Reopen and verify stem children
+        let db = VerkleDb::<RocksDb>::from_path(&path);
+        let config = DefaultConfig::new(db);
+        let trie = crate::trie::Trie::new(config);
+
+        let stem_prefix = [42u8; 31];
+        for suffix in 0..5u8 {
+            let mut key = [0u8; 32];
+            key[..31].copy_from_slice(&stem_prefix);
+            key[31] = suffix;
+            let expected_value = [suffix; 32];
+
+            let retrieved = trie.get(key);
+            assert_eq!(
+                retrieved,
+                Some(expected_value),
+                "Stem child {} should be retrievable after reopen",
+                suffix
+            );
+        }
+    }
+
+    /// Test: Multiple flush-reopen cycles
+    #[test]
+    fn test_multiple_reopen_cycles() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().to_path_buf();
+
+        // Cycle 1: Initial insert
+        {
+            let db = VerkleDb::<RocksDb>::from_path(&path);
+            let config = DefaultConfig::new(db);
+            let mut trie = crate::trie::Trie::new(config);
+            trie.insert_single([1u8; 32], [10u8; 32]);
+            trie.storage.flush();
+        }
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        // Cycle 2: Reopen, add more data, flush
+        {
+            let db = VerkleDb::<RocksDb>::from_path(&path);
+            let config = DefaultConfig::new(db);
+            let mut trie = crate::trie::Trie::new(config);
+
+            // Verify first insert is still there
+            assert_eq!(trie.get([1u8; 32]), Some([10u8; 32]));
+
+            // Add more data
+            trie.insert_single([2u8; 32], [20u8; 32]);
+            trie.storage.flush();
+        }
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        // Cycle 3: Final verification
+        let db = VerkleDb::<RocksDb>::from_path(&path);
+        let config = DefaultConfig::new(db);
+        let trie = crate::trie::Trie::new(config);
+
+        assert_eq!(trie.get([1u8; 32]), Some([10u8; 32]), "First insert should persist");
+        assert_eq!(trie.get([2u8; 32]), Some([20u8; 32]), "Second insert should persist");
+    }
+
+    /// Test that storage contents can be retrieved after reopening
+    #[test]
+    fn test_debug_storage_contents() {
+        use crate::database::generic::{BRANCH_TABLE_MARKER, LEAF_TABLE_MARKER, STEM_TABLE_MARKER};
+
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().to_path_buf();
+        let key = [42u8; 32];
+        let value = [99u8; 32];
+
+        // Phase 1: Insert and flush
+        {
+            let db = VerkleDb::<RocksDb>::from_path(&path);
+            let config = DefaultConfig::new(db);
+            let mut trie = crate::trie::Trie::new(config);
+            trie.insert_single(key, value);
+            trie.storage.flush();
+        }
+
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        // Phase 2: Open raw RocksDB and verify contents exist
+        let raw_db = RocksDb::open_default(&path).unwrap();
+
+        // Check leaf entry exists
+        let mut leaf_key = vec![LEAF_TABLE_MARKER];
+        leaf_key.extend_from_slice(&key);
+        let leaf_val = raw_db.get(&leaf_key).unwrap();
+        assert!(leaf_val.is_some(), "Leaf entry should exist");
+        assert_eq!(leaf_val.unwrap().len(), 32, "Leaf value should be 32 bytes");
+
+        // Check stem entry exists
+        let stem_key: [u8; 31] = key[..31].try_into().unwrap();
+        let mut stem_db_key = vec![STEM_TABLE_MARKER];
+        stem_db_key.extend_from_slice(&stem_key);
+        let stem_val = raw_db.get(&stem_db_key).unwrap();
+        assert!(stem_val.is_some(), "Stem entry should exist");
+        // 3 points * 64 bytes + 3 scalars * 32 bytes = 288 bytes
+        assert_eq!(stem_val.unwrap().len(), 288, "Stem meta should be 288 bytes");
+
+        // Check branch root entry exists
+        let root_key = vec![BRANCH_TABLE_MARKER];
+        let root_val = raw_db.get(&root_key).unwrap();
+        assert!(root_val.is_some(), "Branch root entry should exist");
+        // 1 tag byte + 64 bytes point + 32 bytes scalar = 97 bytes
+        assert_eq!(root_val.unwrap().len(), 97, "Branch meta should be 97 bytes");
+
+        // Reopen and verify data can be retrieved
+        drop(raw_db);
+        let db = VerkleDb::<RocksDb>::from_path(&path);
+        let config = DefaultConfig::new(db);
+        let trie = crate::trie::Trie::new(config);
+        let retrieved = trie.get(key);
+        assert_eq!(retrieved, Some(value), "Value should be retrievable after reopen");
     }
 }

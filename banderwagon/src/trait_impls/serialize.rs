@@ -1,5 +1,4 @@
 use crate::Element;
-use ark_ec::CurveGroup;
 use ark_ed_on_bls12_381_bandersnatch::EdwardsProjective;
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize, SerializationError, Valid};
 impl CanonicalSerialize for Element {
@@ -13,7 +12,7 @@ impl CanonicalSerialize for Element {
                 writer.write_all(&self.to_bytes())?;
                 Ok(())
             }
-            ark_serialize::Compress::No => self.0.into_affine().serialize_uncompressed(writer),
+            ark_serialize::Compress::No => self.0.serialize_uncompressed(writer),
         }
     }
 
@@ -56,7 +55,7 @@ impl CanonicalDeserialize for Element {
                     }
                 }
                 ark_serialize::Compress::No => {
-                    let point = EdwardsProjective::deserialize_uncompressed(reader)?;
+                    let point = EdwardsProjective::deserialize_uncompressed_unchecked(reader)?;
                     Ok(Element(point))
                 }
             }

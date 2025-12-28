@@ -16,6 +16,8 @@ namespace Verkle.Bindings
 
 
 
+
+
         [DllImport(__DllName, EntryPoint = "context_new", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
         internal static extern Context* context_new();
 

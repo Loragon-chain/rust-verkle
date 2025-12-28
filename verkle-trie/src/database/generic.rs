@@ -46,7 +46,9 @@ impl<T: BatchWriter> WriteOnlyHigherDb for GenericBatchWriter<T> {
         labelled_key.push(BRANCH_TABLE_MARKER);
         labelled_key.extend(branch_child_id);
 
-        self.inner.batch_put(&labelled_key, &stem_id);
+        let branch_child = BranchChild::Stem(stem_id);
+        self.inner
+            .batch_put(&labelled_key, &branch_child.to_bytes().unwrap());
         None
     }
 
@@ -55,8 +57,9 @@ impl<T: BatchWriter> WriteOnlyHigherDb for GenericBatchWriter<T> {
         labelled_key.push(BRANCH_TABLE_MARKER);
         labelled_key.extend_from_slice(&key);
 
+        let branch_child = BranchChild::Branch(meta);
         self.inner
-            .batch_put(&labelled_key, &meta.to_bytes().unwrap());
+            .batch_put(&labelled_key, &branch_child.to_bytes().unwrap());
         None
     }
 
@@ -160,9 +163,11 @@ impl<T: BareMetalKVDb> ReadOnlyHigherDb for GenericBatchDB<T> {
         labelled_key.push(BRANCH_TABLE_MARKER);
         labelled_key.extend_from_slice(key);
 
-        self.inner
-            .fetch(&labelled_key)
-            .map(|old_val_bytes| BranchMeta::from_bytes(old_val_bytes).unwrap())
+        self.inner.fetch(&labelled_key).and_then(|old_val_bytes| {
+            BranchChild::from_bytes(old_val_bytes)
+                .ok()
+                .and_then(|bc| bc.branch())
+        })
     }
 
     fn get_branch_child(&self, branch_id: &[u8], index: u8) -> Option<BranchChild> {
